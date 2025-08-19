@@ -267,7 +267,7 @@ namespace DBFImport
                 case 'I':
                     return ReadFieldInteger(data);
                 case 'N':
-                    return ReadFieldNumeric(data);
+                    return ReadFieldNumeric(fd, data);
                 case 'L':
                     return ReadFieldLogical(data);
                 case 'D':
@@ -370,18 +370,61 @@ namespace DBFImport
             throw new NotSupportedException($"Unknown logical value ({ch})");
         }
 
-        private decimal? ReadFieldNumeric(byte[] data)
+        private decimal? ReadFieldNumeric(DbfFieldDescriptor fd, byte[] data)
         {
-            string text = System.Text.Encoding.ASCII.GetString(data).TrimStart();
+            string raw = textEncoding.GetString(data);
 
-            if (text == "")
+            if (raw.Length == 0)
                 return null;
 
-            if (text.StartsWith('.'))
-                text = '0' + text;
+            // Remove embedded nulls, trim spaces
+            string text = raw.Replace('\0', ' ').Trim();
 
-            var d = decimal.Parse(text, CultureInfo.InvariantCulture.NumberFormat);
-            return d;
+            if (text.Length == 0)
+                return null;
+
+            // All asterisks (DBF overflow placeholder) -> null
+            bool allStars = true;
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] != '*') { allStars = false; break; }
+            }
+            if (allStars)
+                return null;
+
+            // Sign only
+            if (text == "+" || text == "-")
+                return null;
+
+            // Handle leading dot patterns
+            if (text.StartsWith("."))
+                text = "0" + text;
+            else if (text.StartsWith("-."))
+                text = "-0" + text.Substring(1);
+
+            // Remove thousands separators if they slipped in
+            if (text.IndexOf(',') >= 0)
+                text = text.Replace(",", "");
+
+            // Some DBF files may pad with trailing '+' or '-' (rare) -> trim
+            text = text.TrimEnd('+', '-');
+
+            // If still contains unexpected characters (letters) treat as null (DBF numeric normally has digits, sign, dot)
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (!(c >= '0' && c <= '9') && c != '-' && c != '+' && c != '.')
+                {
+                    Console.WriteLine($"[DBFImport] Invalid numeric chars in field {fd.Name}: '{text}' -> NULL");
+                    return null;
+                }
+            }
+
+            if (decimal.TryParse(text, System.Globalization.NumberStyles.Any, CultureInfo.InvariantCulture, out var d))
+                return d;
+
+            Console.WriteLine($"[DBFImport] Failed to parse numeric field {fd.Name}: '{text}' -> NULL");
+            return null;
         }
 
         private int ReadFieldInteger(byte[] data)
