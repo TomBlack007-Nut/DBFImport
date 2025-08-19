@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Data.SqlTypes;
 
 namespace DBFImport
 {
@@ -210,8 +211,7 @@ namespace DBFImport
 
                 if (status == 0x2A)
                 {
-                    // Deleted record.  Read fields but don't store results.
-                    // Don't create Record object, which gives some performance boost on tables with many deleted records.
+                    // Deleted record - skip storing
                     for (int fdNo = 0; fdNo < fieldDescriptors.Count; fdNo++)
                     {
                         var fd = fieldDescriptors[fdNo];
@@ -230,9 +230,7 @@ namespace DBFImport
                 else
                 {
                     var record = new Record();
-
                     record.RecordNo = recordNo;
-
                     record.Fields = new object[fieldDescriptors.Count];
 
                     for (int fdNo = 0; fdNo < fieldDescriptors.Count; fdNo++)
@@ -264,6 +262,8 @@ namespace DBFImport
             {
                 case 'C':
                     return ReadFieldText(data);
+                case 'V': // Visual FoxPro VARCHAR
+                    return ReadFieldVarchar(data);
                 case 'I':
                     return ReadFieldInteger(data);
                 case 'N':
@@ -278,8 +278,7 @@ namespace DBFImport
                     return ReadFieldTime(data);
                 case 'W': //?
                     return null;
-                case '0'
-                    : // _NullFlags?  https://stackoverflow.com/questions/30886730/adding-data-to-dbf-file-adds-column-nullflags
+                case '0': // _NullFlags
                     return null;
             }
 
@@ -290,12 +289,6 @@ namespace DBFImport
         {
             if (data.Length != 8)
                 throw new InvalidOperationException($"Time has invalid length ({data.Length} instead of 8)");
-
-            // "Days since Jan 1, 4713 BC"
-            // JD = Days since "12h Jan 1, 4713 BC"
-            // 19/09/2018 JD=2458380.5 ==> Days = 2458381
-            // DateTime(19/09/2018) - DateTime.MinValue = 736955
-            // "Days since Jan 1, 4713 BC" on DateTime.MinValue = 2458381 - 736955 = 1721426
 
             const int daysOnDateTimeMinValue = 1721426;
 
@@ -313,9 +306,9 @@ namespace DBFImport
             if (data.Length == 4)
             {
                 if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0)
-                    return null; //???
+                    return null;
                 if (data[0] == 0x20 && data[1] == 0x20 && data[2] == 0x20 && data[3] == 0x20)
-                    return null; //???
+                    return null;
 
                 return "<Not implemented>";
             }
@@ -334,7 +327,29 @@ namespace DBFImport
                 text = "20" + text.Substring(2);
             }
 
-            return DateTime.ParseExact(text, "yyyyMMdd", null);
+            DateTime dt;
+            try
+            {
+                dt = DateTime.ParseExact(text, "yyyyMMdd", null);
+            }
+            catch
+            {
+                Console.WriteLine($"[DBFImport] Invalid date format: '{text}', setting to SQL NULL.");
+                return null;
+            }
+
+            if (dt < DateTime.MinValue || dt > DateTime.MaxValue)
+                return null;
+
+            // If staying with DATETIME2 this entire range is valid.
+            // If table still uses DATETIME (old build), null-out < 1753-01-01
+            if (dt < SqlDateTime.MinValue.Value)
+            {
+                Console.WriteLine($"[DBFImport] Date below SQL DATETIME min: '{text}' -> {dt}, setting to NULL.");
+                return null;
+            }
+
+            return dt;
         }
 
         private bool? ReadFieldLogical(byte[] data)
@@ -382,6 +397,12 @@ namespace DBFImport
             return textEncoding.GetString(data).TrimEnd();
         }
 
+        private string ReadFieldVarchar(byte[] data)
+        {
+            // VFP VARCHAR: unused bytes are filled with 0x00 then spaces; trim both.
+            return textEncoding.GetString(data).TrimEnd('\0', ' ');
+        }
+
         class DbfHeader : IHeader
         {
             public byte Version { get; set; }
@@ -407,18 +428,20 @@ namespace DBFImport
                 {
                     case 'C':
                         return $"VARCHAR({Length})";
+                    case 'V': // VARCHAR (Visual FoxPro)
+                        return $"VARCHAR({Length})";
                     case 'I':
                         return "INT";
                     case 'N':
                         return $"DECIMAL({Length + 1}, {DecimalCount})";
                     case 'L':
                         return "BIT";
-                    case 'D':
-                        return "DATETIME";
+                    case 'D':   
+                        return "DATETIME2"; // changed from DATETIME
                     case 'M':
                         return "VARCHAR(MAX)";
                     case 'T':
-                        return "DATETIME";
+                        return "DATETIME2"; // broader range
                     case 'W': //?
                         return "VARCHAR(MAX)";
                     case '0':
@@ -439,6 +462,8 @@ namespace DBFImport
                 {
                     case 'C':
                         return new SqlParameter(name, SqlDbType.VarChar, Length);
+                    case 'V':
+                        return new SqlParameter(name, SqlDbType.VarChar, Length);
                     case 'I':
                         return new SqlParameter(name, SqlDbType.Int);
                     case 'N':
@@ -451,11 +476,11 @@ namespace DBFImport
                     case 'L':
                         return new SqlParameter(name, SqlDbType.Bit);
                     case 'D':
-                        return new SqlParameter(name, SqlDbType.DateTime);
+                        return new SqlParameter(name, SqlDbType.DateTime2);
                     case 'M':
                         return new SqlParameter(name, SqlDbType.VarChar, -1);
                     case 'T':
-                        return new SqlParameter(name, SqlDbType.DateTime);
+                        return new SqlParameter(name, SqlDbType.DateTime2);
                     case 'W': //?
                         return new SqlParameter(name, SqlDbType.VarChar, -1);
                     case '0':
